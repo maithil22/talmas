@@ -106,6 +106,31 @@ python scripts/run_ablation.py \
 
 Outputs `results/talmas_ablation_<timestamp>.csv` and `results/talmas_ablation_<timestamp>.png`.
 
+### Checkpointing (resumable runs)
+
+Pass `--checkpoint <file>` to write each result to a JSONL file immediately after it is evaluated. If the process is interrupted (e.g. a GCP spot instance preemption), rerun the **exact same command** and it will skip already-evaluated examples and continue from where it left off.
+
+```bash
+python scripts/gsm8k_eval.py \
+    --model GSAI-ML/LLaDA-8B-Base \
+    --max_samples 100 \
+    --checkpoint results/ckpt_baseline.jsonl \
+    --output-dir results
+```
+
+On restart after preemption:
+```
+Resuming from checkpoint 'results/ckpt_baseline.jsonl': 47 examples already done (33/47 correct).
+Evaluating on 53 remaining examples...
+```
+
+The checkpoint file is append-only, so a mid-write crash cannot corrupt previously saved lines. The final JSON summary (`--output-dir`) is still written at the end as usual.
+
+For extra safety on GCP, sync the checkpoint to Cloud Storage periodically:
+```bash
+gsutil cp results/ckpt_baseline.jsonl gs://your-bucket/talmas/
+```
+
 ### Quick smoke-test
 
 ```bash
@@ -129,6 +154,7 @@ Config 1 (`λ_max=0`) should match the baseline exactly. If configs 2–5 all re
 | `--steps` | 1024 / 512 | Override diffusion steps |
 | `--output-dir` | `results` | Directory for auto-named JSON output |
 | `--output_file` | — | Explicit output path |
+| `--checkpoint` | — | JSONL file for incremental checkpointing; resumes if file exists |
 | `--verbose` | off | Print per-example predictions |
 | `--talmas` | off | Enable TALMAS suppression |
 | `--lambda-max` | `4.0` | Maximum bias magnitude |
@@ -185,3 +211,4 @@ Defaults for `generation_length` and `steps` are `1024` for base models and `512
 | CUDA OOM | `generation_length` or `steps` too large | Reduce `--generation_length` and `--steps`; bfloat16 is already used |
 | Accuracy identical across μ values | μ sweep not creating new hook managers | Each config in `run_ablation.py` creates a fresh `TALMASHookManager`; check for exception output |
 | `logits` shape error | LLaDA output object changed | Access via `model(...).logits`; inspect return type with a single forward pass |
+| Spot VM preempted, progress lost | No checkpoint file specified | Always pass `--checkpoint results/ckpt.jsonl`; restart with the same command to resume |

@@ -104,7 +104,27 @@ def evaluate(args) -> float:
     dataset = load_dataset("gsm8k", "main", split=args.split)
     if args.max_samples:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-    print(f"Evaluating on {len(dataset)} examples...\n")
+
+    # ------------------------------------------------------------------ #
+    # Resume from checkpoint if present                                    #
+    # ------------------------------------------------------------------ #
+    results: list = []
+    correct = 0
+
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        with open(args.checkpoint) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    results.append(json.loads(line))
+        correct = sum(r["correct"] for r in results)
+        n_done  = len(results)
+        print(f"Resuming from checkpoint '{args.checkpoint}': "
+              f"{n_done} examples already done ({correct}/{n_done} correct).")
+        dataset = dataset.select(range(n_done, len(dataset)))
+
+    total = len(results)
+    print(f"Evaluating on {len(dataset)} remaining examples...\n")
 
     # ------------------------------------------------------------------ #
     # Set up TALMAS hooks                                                  #
@@ -116,10 +136,6 @@ def evaluate(args) -> float:
     # ------------------------------------------------------------------ #
     # Eval loop                                                            #
     # ------------------------------------------------------------------ #
-    correct = 0
-    total = 0
-    results = []
-
     try:
         for example in tqdm(dataset, desc="GSM8K"):
             question  = example["question"]
@@ -151,20 +167,29 @@ def evaluate(args) -> float:
             correct += int(is_correct)
             total   += 1
 
-            results.append({
+            entry = {
                 "question":   question,
                 "gold":       gold_ans,
                 "prediction": pred_ans,
                 "output":     output_text,
                 "correct":    is_correct,
-            })
+            }
+            results.append(entry)
 
+            # Append to checkpoint immediately so progress survives preemption
+            if args.checkpoint:
+                with open(args.checkpoint, "a") as ckpt_f:
+                    ckpt_f.write(json.dumps(entry) + "\n")
+
+            status = "✓" if is_correct else "✗"
+            running_acc = correct / total * 100
+            tqdm.write(
+                f"[{total:>4}] {status}  gold={gold_ans:<8}  pred={pred_ans:<8}  "
+                f"running acc: {correct}/{total} ({running_acc:.1f}%)"
+            )
             if args.verbose:
-                status = "✓" if is_correct else "✗"
-                print(f"\n[{total}] {status}")
-                print(f"  Q: {question[:80]}...")
-                print(f"  Gold: {gold_ans}  |  Pred: {pred_ans}")
-                print(f"  Output: {output_text[:200]}")
+                tqdm.write(f"       Q: {question[:80]}...")
+                tqdm.write(f"       Output: {output_text[:200]}")
     finally:
         if hook_manager is not None:
             hook_manager.remove()
@@ -234,6 +259,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Save results to this specific JSON path")
     parser.add_argument("--output-dir", type=str, default="results",
                         help="Directory to auto-name and save results JSON")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="JSONL file for incremental checkpointing; resumes from this "
+                             "file if it already exists (safe to reuse on preemption)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-example predictions")
 
