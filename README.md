@@ -187,8 +187,8 @@ Config 1 (`λ_max=0`) should match the baseline exactly. If configs 2–5 all re
 | `--model` | `GSAI-ML/LLaDA-8B-Base` | HuggingFace model ID or local path |
 | `--split` | `test` | GSM8K split (`train` or `test`) |
 | `--max_samples` | all | Limit evaluation examples |
-| `--generation_length` | 1024 / 512 | Override response token budget |
-| `--steps` | 1024 / 512 | Override diffusion steps |
+| `--generation_length` | `256` | Number of response tokens to generate |
+| `--steps` | `256` | Number of diffusion steps |
 | `--output-dir` | `results` | Directory for auto-named JSON output |
 | `--output_file` | — | Explicit output path |
 | `--checkpoint` | — | JSONL file for incremental checkpointing; resumes if file exists |

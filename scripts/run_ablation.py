@@ -267,9 +267,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-samples", type=int, default=100,
                         dest="max_samples",
                         help="Samples per config (None = full test set)")
-    parser.add_argument("--steps", type=int, default=None,
-                        help="Override diffusion steps (default: model preset)")
-    parser.add_argument("--generation-length", type=int, default=None,
+    parser.add_argument("--steps", type=int, default=256,
+                        help="Number of diffusion steps")
+    parser.add_argument("--generation-length", type=int, default=256,
                         dest="generation_length",
                         help="Override generation length")
     parser.add_argument("--output-dir", type=str, default="results",

@@ -66,6 +66,7 @@ def evaluate(args) -> float:
             mu=args.mu,
             use_timestep_gate=not args.no_timestep_gate,
             use_layer_gate=not args.no_layer_gate,
+            sigmoid_slope=args.sigmoid_slope,
         )
 
     print(f"Model:             {args.model}")
@@ -110,6 +111,9 @@ def evaluate(args) -> float:
     # ------------------------------------------------------------------ #
     results: list = []
     correct = 0
+
+    if args.checkpoint:
+        os.makedirs(os.path.dirname(os.path.abspath(args.checkpoint)), exist_ok=True)
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         with open(args.checkpoint) as f:
@@ -249,10 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="GSM8K split to evaluate on")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of examples (None = full 1319-example test set)")
-    parser.add_argument("--generation_length", type=int, default=None,
-                        help="Override generation length")
-    parser.add_argument("--steps", type=int, default=None,
-                        help="Override number of diffusion steps")
+    parser.add_argument("--generation_length", type=int, default=256,
+                        help="Number of response tokens to generate")
+    parser.add_argument("--steps", type=int, default=256,
+                        help="Number of diffusion steps")
 
     # --- Output ---
     parser.add_argument("--output_file", type=str, default=None,
@@ -277,6 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Disable f(1-r_t) quadratic timestep gate")
     talmas.add_argument("--no-layer-gate", action="store_true",
                         help="Disable g(ℓ/L) sigmoid layer gate")
+    talmas.add_argument("--sigmoid-slope", type=float, default=8.0,
+                        help="Steepness of the sigmoid layer gate g(ℓ/L)")
 
     return parser
 

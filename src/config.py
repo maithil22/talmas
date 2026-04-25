@@ -18,14 +18,14 @@ class SamplingConfig:
 
 
 BASE_CONFIG = SamplingConfig(
-    generation_length=1024,
-    steps=1024,
+    generation_length=256,
+    steps=256,
     zero_eos_confidence=False,
 )
 
 INSTRUCT_CONFIG = SamplingConfig(
-    generation_length=512,
-    steps=512,
+    generation_length=256,
+    steps=256,
     zero_eos_confidence=True,
 )
 

@@ -8,7 +8,7 @@ List all configs:
 Run a single config (one machine):
   python scripts/run_sweep.py --config-id 12 \\
       --model GSAI-ML/LLaDA-8B-Instruct \\
-      --max-samples 100 --steps 128 \\
+      --max-samples 100 --steps 256 \\
       --output-dir results/sweep
 
 Distribute across machines (example: 5 VMs, one λ row each):
@@ -26,21 +26,11 @@ import os
 import csv
 import json
 import argparse
-from datetime import datetime
-from typing import Optional
-
-import torch
-from datasets import load_dataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.config import (
-    SamplingConfig, TALMASConfig,
-    BASE_CONFIG, INSTRUCT_CONFIG,
-    SWEEP_CONFIGS, SWEEP_CONFIG_BY_ID,
-)
-from src.utils import load_model_and_tokenizer, resolve_special_tokens
-from src.eval_loop import eval_gsm8k_config
+from src.config import SWEEP_CONFIGS, SWEEP_CONFIG_BY_ID
+from scripts.gsm8k_eval import evaluate
 
 
 # ---------------------------------------------------------------------------
@@ -60,31 +50,6 @@ def _append_csv(csv_path: str, row: dict) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in _CSV_FIELDS})
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint helpers
-# ---------------------------------------------------------------------------
-
-def _ckpt_path(output_dir: str, config_id: int) -> str:
-    return os.path.join(output_dir, f"sweep_cfg{config_id:02d}.jsonl")
-
-
-def _count_lines(path: str) -> int:
-    if not os.path.exists(path):
-        return 0
-    with open(path) as f:
-        return sum(1 for line in f if line.strip())
-
-
-def _load_correct(path: str) -> int:
-    correct = 0
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                correct += int(json.loads(line).get("correct", False))
-    return correct
 
 
 # ---------------------------------------------------------------------------
@@ -111,82 +76,48 @@ def list_configs() -> None:
 
 def run(args) -> None:
     cfg_meta = SWEEP_CONFIG_BY_ID[args.config_id]
-
-    is_instruct = "instruct" in args.model.lower()
-    sampling_cfg = INSTRUCT_CONFIG if is_instruct else BASE_CONFIG
-    if args.steps:
-        sampling_cfg.steps = args.steps
-    if args.generation_length:
-        sampling_cfg.generation_length = args.generation_length
-
     os.makedirs(args.output_dir, exist_ok=True)
-    ckpt = _ckpt_path(args.output_dir, args.config_id)
+
+    ckpt     = os.path.join(args.output_dir, f"sweep_cfg{args.config_id:02d}.jsonl")
     csv_path = os.path.join(args.output_dir, "sweep_results.csv")
 
     print(f"Config {args.config_id}: λ_max={cfg_meta['lambda_max']}  "
           f"μ={cfg_meta['mu']}  slope={cfg_meta['sigmoid_slope']}")
-    print(f"Model:      {args.model}")
-    print(f"Steps:      {sampling_cfg.steps}   GenLen: {sampling_cfg.generation_length}")
-    print(f"Checkpoint: {ckpt}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device:     {device}\n")
-
-    # Load dataset
-    print("Loading GSM8K dataset...")
-    dataset = load_dataset("gsm8k", "main", split=args.split)
-    if args.max_samples:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-    n_total = len(dataset)
-
-    # Resume from checkpoint if partial
-    offset = _count_lines(ckpt)
-    prior_correct = 0
-    if offset >= n_total:
-        print(f"Already complete ({offset}/{n_total}). Loading from checkpoint.")
-        prior_correct = _load_correct(ckpt)
-        accuracy = prior_correct / offset if offset > 0 else 0.0
-        print(f"Accuracy: {prior_correct}/{offset} = {accuracy:.3f}")
-        return
-    if offset > 0:
-        prior_correct = _load_correct(ckpt)
-        print(f"Resuming from {offset}/{n_total} (prior correct: {prior_correct})")
-        dataset = dataset.select(range(offset, n_total))
-    else:
-        print(f"Evaluating {n_total} examples...\n")
-
-    # Load model (always eager — TALMAS hook requires it)
-    tokenizer, model = load_model_and_tokenizer(args.model, eager_attn=True)
-    mask_token_id, eos_token_id = resolve_special_tokens(tokenizer, model)
-    print(f"mask_token_id={mask_token_id}  eos_token_id={eos_token_id}\n")
-
-    talmas_cfg = TALMASConfig(
+    # Build the Namespace that gsm8k_eval.evaluate() expects
+    eval_args = argparse.Namespace(
+        model=args.model,
+        split=args.split,
+        max_samples=args.max_samples,
+        generation_length=args.generation_length,
+        steps=args.steps,
+        # TALMAS — always enabled for sweep configs
+        talmas=True,
         lambda_max=cfg_meta["lambda_max"],
         mu=cfg_meta["mu"],
-        use_timestep_gate=cfg_meta.get("use_timestep_gate", True),
-        use_layer_gate=cfg_meta.get("use_layer_gate", True),
         sigmoid_slope=cfg_meta["sigmoid_slope"],
-        timestep_exponent=2.0,
+        no_timestep_gate=not cfg_meta.get("use_timestep_gate", True),
+        no_layer_gate=not cfg_meta.get("use_layer_gate", True),
+        # Checkpointing — written by gsm8k_eval; we read it back for the CSV
+        checkpoint=ckpt,
+        verbose=False,
+        # Output — we write the CSV ourselves; suppress gsm8k_eval's JSON save
+        output_dir=None,
+        output_file=None,
     )
 
-    summary = eval_gsm8k_config(
-        model=model, tokenizer=tokenizer, device=device,
-        mask_token_id=mask_token_id, eos_token_id=eos_token_id,
-        sampling_cfg=sampling_cfg, talmas_cfg=talmas_cfg,
-        is_instruct=is_instruct, dataset=dataset,
-        checkpoint_path=ckpt,
-        desc=f"cfg{args.config_id}",
-    )
+    accuracy_pct = evaluate(eval_args)  # returns accuracy as a percentage
 
-    total_correct = summary["correct"] + prior_correct
-    total_done = summary["total"] + offset
-    accuracy = total_correct / total_done if total_done > 0 else 0.0
-
-    print(f"\n{'='*50}")
-    print(f"Config {args.config_id} — λ={cfg_meta['lambda_max']} μ={cfg_meta['mu']} "
-          f"slope={cfg_meta['sigmoid_slope']}")
-    print(f"Accuracy: {total_correct}/{total_done} = {accuracy:.3f}")
-    print(f"{'='*50}")
+    # Reconstruct correct/total from the checkpoint file gsm8k_eval wrote
+    correct = total = 0
+    if os.path.exists(ckpt):
+        with open(ckpt) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    correct += int(entry.get("correct", False))
+                    total   += 1
 
     _append_csv(csv_path, {
         "config_id":     args.config_id,
@@ -194,9 +125,9 @@ def run(args) -> None:
         "lambda_max":    cfg_meta["lambda_max"],
         "mu":            cfg_meta["mu"],
         "sigmoid_slope": cfg_meta["sigmoid_slope"],
-        "correct":       total_correct,
-        "total":         total_done,
-        "accuracy":      round(accuracy, 6),
+        "correct":       correct,
+        "total":         total,
+        "accuracy":      round(accuracy_pct / 100, 6),
         "checkpoint":    ckpt,
     })
     print(f"Row appended to {csv_path}")
@@ -219,14 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-id", type=int, default=None, dest="config_id",
         help="Sweep config ID to run (see --list-configs)",
     )
-    parser.add_argument("--model", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "test"])
-    parser.add_argument("--max-samples", type=int, default=100, dest="max_samples")
-    parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument(
-        "--generation-length", type=int, default=None, dest="generation_length",
-    )
-    parser.add_argument("--output-dir", type=str, default="results/sweep", dest="output_dir")
+    parser.add_argument("--model",  type=str, default="GSAI-ML/LLaDA-8B-Instruct")
+    parser.add_argument("--split",  type=str, default="test", choices=["train", "test"])
+    parser.add_argument("--max-samples",       type=int,   default=100,  dest="max_samples")
+    parser.add_argument("--steps",             type=int,   default=256)
+    parser.add_argument("--generation-length", type=int,   default=256, dest="generation_length")
+    parser.add_argument("--output-dir",        type=str,   default="results/sweep", dest="output_dir")
     return parser
 
 
@@ -243,8 +172,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.config_id not in SWEEP_CONFIG_BY_ID:
-        valid = sorted(SWEEP_CONFIG_BY_ID.keys())
-        print(f"Error: config_id {args.config_id} not found. Valid ids: {valid}")
+        print(f"Error: unknown config_id {args.config_id}. "
+              f"Valid: {sorted(SWEEP_CONFIG_BY_ID.keys())}")
         sys.exit(1)
 
     run(args)
