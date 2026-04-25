@@ -95,6 +95,43 @@ python scripts/gsm8k_eval.py \
     --verbose
 ```
 
+### Hyperparameter sweep
+
+28 pre-defined configs enumerate a Tier 1 λ_max × μ grid (IDs 1–25) and a Tier 3 sigmoid slope sweep (IDs 26–28). Each config ID runs independently — one per machine.
+
+**List all configs:**
+```bash
+python scripts/run_sweep.py --list-configs
+```
+
+**Run one config (one machine):**
+```bash
+python scripts/run_sweep.py --config-id 12 \
+    --model GSAI-ML/LLaDA-8B-Instruct \
+    --max-samples 100 --steps 128 \
+    --output-dir results/sweep
+```
+
+**Distribute across machines (example: 5 VMs, one λ row each):**
+```bash
+# VM 1: ids 1–5  (λ=1.0)
+for id in 1 2 3 4 5; do
+    python scripts/run_sweep.py --config-id $id \
+        --max-samples 100 --steps 128 --output-dir results/sweep
+done
+
+# VM 2: ids 6–10  (λ=2.0), etc.
+```
+
+Each machine writes `results/sweep/sweep_cfg{id:02d}.jsonl` (one line per example) and appends one row to `results/sweep/sweep_results.csv`. Files from all machines can be merged by concatenating the CSVs. Checkpointing works per config ID: restart the same command after preemption and it resumes from where it left off.
+
+**Tier 3 slope sweep:** after Tier 1 completes, update `lambda_max` and `mu` in `SWEEP_CONFIGS` ids 26–28 in `src/config.py` to the best values found, then run `--config-id 26/27/28`.
+
+| Output file | Description |
+|-------------|-------------|
+| `results/sweep/sweep_cfg{id:02d}.jsonl` | Per-example results for config `id` |
+| `results/sweep/sweep_results.csv` | Accumulated rows: config_id, λ_max, μ, slope, accuracy |
+
 ### Ablation study (all 5 configs + μ sweep)
 
 ```bash
@@ -173,6 +210,19 @@ Defaults for `generation_length` and `steps` are `1024` for base models and `512
 | `--steps` | model preset | Override diffusion steps |
 | `--generation-length` | model preset | Override generation length |
 | `--output-dir` | `results` | CSV and plot output directory |
+
+### `scripts/run_sweep.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--list-configs` | — | Print all 28 sweep configs and exit |
+| `--config-id` | required | Sweep config ID to run (1–28) |
+| `--model` | `GSAI-ML/LLaDA-8B-Instruct` | HuggingFace model ID |
+| `--split` | `test` | GSM8K split |
+| `--max-samples` | `100` | Limit evaluation examples |
+| `--steps` | model preset | Override diffusion steps |
+| `--generation-length` | model preset | Override generation length |
+| `--output-dir` | `results/sweep` | Directory for JSONL checkpoints and CSV |
 
 ---
 

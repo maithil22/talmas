@@ -29,15 +29,15 @@ from src.config import TALMASConfig
 # Gate functions
 # ---------------------------------------------------------------------------
 
-def f_timestep(x: float) -> float:
-    """Quadratic timestep gate.  x = 1 - r_t (fraction of tokens revealed)."""
-    return x ** 2
+def f_timestep(x: float, exponent: float = 2.0) -> float:
+    """Timestep gate.  x = 1 - r_t (fraction of tokens revealed)."""
+    return x ** exponent
 
 
-def g_layer(layer_idx: int, num_layers: int) -> float:
+def g_layer(layer_idx: int, num_layers: int, slope: float = 8.0) -> float:
     """Sigmoid layer gate.  Peaks at deep layers."""
     u = layer_idx / num_layers
-    return torch.sigmoid(torch.tensor(8.0 * (u - 0.5))).item()
+    return torch.sigmoid(torch.tensor(slope * (u - 0.5))).item()
 
 
 def compute_lambda(
@@ -47,6 +47,8 @@ def compute_lambda(
     num_layers: int,
     use_timestep_gate: bool = True,
     use_layer_gate: bool = True,
+    sigmoid_slope: float = 8.0,
+    timestep_exponent: float = 2.0,
 ) -> float:
     """
     λ(ℓ, t) = λ_max · f(1-r_t) · g(ℓ/L)
@@ -55,8 +57,8 @@ def compute_lambda(
     Gates can be disabled independently for ablation.
     """
     x = 1.0 - r_t  # fraction revealed
-    f = f_timestep(x) if use_timestep_gate else 1.0
-    g = g_layer(layer_idx, num_layers) if use_layer_gate else 1.0
+    f = f_timestep(x, exponent=timestep_exponent) if use_timestep_gate else 1.0
+    g = g_layer(layer_idx, num_layers, slope=sigmoid_slope) if use_layer_gate else 1.0
     return lambda_max * f * g
 
 
@@ -123,6 +125,8 @@ class TALMASHookManager:
                 manager.num_layers,
                 use_timestep_gate=manager.cfg.use_timestep_gate,
                 use_layer_gate=manager.cfg.use_layer_gate,
+                sigmoid_slope=manager.cfg.sigmoid_slope,
+                timestep_exponent=manager.cfg.timestep_exponent,
             )
 
             if lam == 0.0:

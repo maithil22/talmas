@@ -2,8 +2,7 @@
 Shared configuration dataclasses and presets for LLaDA evaluation and TALMAS ablation.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +40,8 @@ class TALMASConfig:
     mu: float = 0.1                  # mask→mask partial suppression scale
     use_timestep_gate: bool = True   # apply quadratic f(1-r_t) gate
     use_layer_gate: bool = True      # apply sigmoid g(ℓ/L) layer gate
+    sigmoid_slope: float = 8.0       # steepness of g(ℓ/L) sigmoid (Tier 3 sweep)
+    timestep_exponent: float = 2.0   # exponent of f(x) = x^p (Tier 3 sweep)
 
 
 # ---------------------------------------------------------------------------
@@ -96,3 +97,48 @@ ABLATION_CONFIGS = [
 ]
 
 MU_SWEEP = [0.0, 0.2, 0.5, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Sweep configs  (one entry = one hyperparameter combination)
+#
+# Tier 1 (IDs  1–25): λ_max × μ joint grid, Full TALMAS (both gates on)
+# Tier 3 (IDs 26–28): sigmoid slope sweep — update lambda_max/mu to the best
+#                      values found in Tier 1 before running these.
+# ---------------------------------------------------------------------------
+
+SWEEP_CONFIGS = [
+    # --- Tier 1: λ_max × μ grid (Full TALMAS, both gates on, slope=8.0) ---
+    {"id":  1, "tier": 1, "lambda_max": 1.0, "mu": 0.0, "sigmoid_slope": 8.0},
+    {"id":  2, "tier": 1, "lambda_max": 1.0, "mu": 0.1, "sigmoid_slope": 8.0},
+    {"id":  3, "tier": 1, "lambda_max": 1.0, "mu": 0.2, "sigmoid_slope": 8.0},
+    {"id":  4, "tier": 1, "lambda_max": 1.0, "mu": 0.5, "sigmoid_slope": 8.0},
+    {"id":  5, "tier": 1, "lambda_max": 1.0, "mu": 1.0, "sigmoid_slope": 8.0},
+    {"id":  6, "tier": 1, "lambda_max": 2.0, "mu": 0.0, "sigmoid_slope": 8.0},
+    {"id":  7, "tier": 1, "lambda_max": 2.0, "mu": 0.1, "sigmoid_slope": 8.0},
+    {"id":  8, "tier": 1, "lambda_max": 2.0, "mu": 0.2, "sigmoid_slope": 8.0},
+    {"id":  9, "tier": 1, "lambda_max": 2.0, "mu": 0.5, "sigmoid_slope": 8.0},
+    {"id": 10, "tier": 1, "lambda_max": 2.0, "mu": 1.0, "sigmoid_slope": 8.0},
+    {"id": 11, "tier": 1, "lambda_max": 4.0, "mu": 0.0, "sigmoid_slope": 8.0},
+    {"id": 12, "tier": 1, "lambda_max": 4.0, "mu": 0.1, "sigmoid_slope": 8.0},
+    {"id": 13, "tier": 1, "lambda_max": 4.0, "mu": 0.2, "sigmoid_slope": 8.0},
+    {"id": 14, "tier": 1, "lambda_max": 4.0, "mu": 0.5, "sigmoid_slope": 8.0},
+    {"id": 15, "tier": 1, "lambda_max": 4.0, "mu": 1.0, "sigmoid_slope": 8.0},
+    {"id": 16, "tier": 1, "lambda_max": 6.0, "mu": 0.0, "sigmoid_slope": 8.0},
+    {"id": 17, "tier": 1, "lambda_max": 6.0, "mu": 0.1, "sigmoid_slope": 8.0},
+    {"id": 18, "tier": 1, "lambda_max": 6.0, "mu": 0.2, "sigmoid_slope": 8.0},
+    {"id": 19, "tier": 1, "lambda_max": 6.0, "mu": 0.5, "sigmoid_slope": 8.0},
+    {"id": 20, "tier": 1, "lambda_max": 6.0, "mu": 1.0, "sigmoid_slope": 8.0},
+    {"id": 21, "tier": 1, "lambda_max": 8.0, "mu": 0.0, "sigmoid_slope": 8.0},
+    {"id": 22, "tier": 1, "lambda_max": 8.0, "mu": 0.1, "sigmoid_slope": 8.0},
+    {"id": 23, "tier": 1, "lambda_max": 8.0, "mu": 0.2, "sigmoid_slope": 8.0},
+    {"id": 24, "tier": 1, "lambda_max": 8.0, "mu": 0.5, "sigmoid_slope": 8.0},
+    {"id": 25, "tier": 1, "lambda_max": 8.0, "mu": 1.0, "sigmoid_slope": 8.0},
+    # --- Tier 3: sigmoid slope sweep (update lambda_max/mu to best Tier 1 values) ---
+    {"id": 26, "tier": 3, "lambda_max": 4.0, "mu": 0.1, "sigmoid_slope":  4.0},
+    {"id": 27, "tier": 3, "lambda_max": 4.0, "mu": 0.1, "sigmoid_slope":  8.0},
+    {"id": 28, "tier": 3, "lambda_max": 4.0, "mu": 0.1, "sigmoid_slope": 16.0},
+]
+
+# Lookup by id for O(1) access
+SWEEP_CONFIG_BY_ID = {c["id"]: c for c in SWEEP_CONFIGS}
