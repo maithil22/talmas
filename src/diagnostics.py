@@ -3,17 +3,23 @@ Diagnostic data collection and visualization for TALMAS denoising analysis.
 
 Captures per-step data during low_confidence_remasking_sample and writes
 four files to output_dir/:
-  attention.gif    — animated attention heatmap (last layer, response×response)
-  suppression.gif  — animated TALMAS bias matrix (last layer, response×response)
-  confidence.png   — per-position confidence at sampled denoising steps
+  attention.png    — grid of attention heatmaps (last layer, every 10 steps)
+  suppression.png  — grid of suppression bias heatmaps (last layer, every 10 steps)
+  confidence.png   — per-position confidence at every 10 steps
   scalar.png       — mean attention flowing to [MASK] tokens over all steps
+
+Each attention/suppression heatmap uses 4-color quadrant coding:
+  Blue    — real → real      (baseline attention between revealed tokens)
+  Red     — real → [MASK]    (what TALMAS suppresses)
+  Green   — [MASK] → real
+  Magenta — [MASK] → [MASK]  (partially suppressed via μ)
 
 Install DiagnosticsCollector AFTER TALMASHookManager so it wraps the
 already-patched block forward.  Remove it BEFORE TALMASHookManager.remove().
 """
 
 import functools
-import io
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -33,7 +39,7 @@ class DiagnosticsCollector:
         talmas_cfg: Optional[TALMASConfig],
         num_layers: int,
         capture_attn_every: int = 10,
-        capture_conf_every: int = 50,
+        capture_conf_every: int = 10,
     ):
         self.talmas_cfg = talmas_cfg
         self.num_layers = num_layers
@@ -107,7 +113,7 @@ class DiagnosticsCollector:
         last.forward = capturing_fwd
 
     # ------------------------------------------------------------------
-    # Sampling loop interface — called from low_confidence_remasking_sample
+    # Sampling loop interface
     # ------------------------------------------------------------------
 
     def begin_step(self, step_idx: int, t_val: float, mask_positions: torch.Tensor) -> None:
@@ -156,11 +162,10 @@ class DiagnosticsCollector:
         print(f"\nGenerating diagnostics in {output_dir}/")
 
         if self._attn:
-            _make_gif(
+            _make_heatmap_grid(
                 self._attn, self._mask, self._t_vals, prompt_len,
-                title_prefix="Attention (last layer, mean over heads)",
-                cmap="viridis",
-                out_path=os.path.join(output_dir, "attention.gif"),
+                title="Attention weights — last layer, mean over heads",
+                out_path=os.path.join(output_dir, "attention.png"),
             )
             _plot_scalar(
                 self._attn, self._mask, self._t_vals, prompt_len,
@@ -168,16 +173,15 @@ class DiagnosticsCollector:
             )
 
         if self._supp:
-            _make_gif(
+            _make_heatmap_grid(
                 self._supp, self._mask, self._t_vals, prompt_len,
-                title_prefix="TALMAS suppression bias (last layer)",
-                cmap="Reds",
-                out_path=os.path.join(output_dir, "suppression.gif"),
+                title="TALMAS suppression bias — last layer",
+                out_path=os.path.join(output_dir, "suppression.png"),
             )
 
         if self._conf:
             _plot_confidence(
-                self._conf, self._mask, prompt_len,
+                self._conf, self._t_vals,
                 out_path=os.path.join(output_dir, "confidence.png"),
             )
 
@@ -191,120 +195,160 @@ def _resp(arr: np.ndarray, p: int) -> np.ndarray:
     return arr[p:, p:]
 
 
-def _fig_to_pil(fig):
-    """Render a matplotlib figure to a PIL Image via an in-memory PNG buffer."""
-    from PIL import Image
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    buf.seek(0)
-    img = Image.open(buf).copy()
-    buf.close()
-    return img
+def _render_quadrant_heatmap(arr: np.ndarray, mask_resp: np.ndarray, vmax: float) -> np.ndarray:
+    """
+    Return (L, L, 3) float32 RGB image with 4-color quadrant coding.
+
+    Intensity encodes attention weight (0 = white, max = saturated color).
+    Color encodes the interaction type:
+      Blue    — real query    → real key      (baseline)
+      Red     — real query    → [MASK] key    (suppressed by TALMAS)
+      Green   — [MASK] query  → real key
+      Magenta — [MASK] query  → [MASK] key   (partially suppressed via μ)
+    """
+    v = np.clip(arr / (vmax or 1.0), 0, 1).astype(np.float32)  # (L, L)
+
+    m_q = mask_resp[:, None].astype(bool)   # (L, 1) — query is [MASK]
+    m_k = mask_resp[None, :].astype(bool)   # (1, L) — key   is [MASK]
+
+    rgb = np.ones((arr.shape[0], arr.shape[1], 3), dtype=np.float32)  # start white
+
+    # real → real  :  subtract v from R and G  →  white→blue
+    rr = (~m_q) & (~m_k)
+    rgb[:, :, 0] -= np.where(rr, v, 0)
+    rgb[:, :, 1] -= np.where(rr, v, 0)
+
+    # real → [MASK]:  subtract v from G and B  →  white→red
+    rm = (~m_q) & m_k
+    rgb[:, :, 1] -= np.where(rm, v, 0)
+    rgb[:, :, 2] -= np.where(rm, v, 0)
+
+    # [MASK] → real:  subtract v from R and B  →  white→green
+    mr = m_q & (~m_k)
+    rgb[:, :, 0] -= np.where(mr, v, 0)
+    rgb[:, :, 2] -= np.where(mr, v, 0)
+
+    # [MASK] → [MASK]:  subtract v from G      →  white→magenta
+    mm = m_q & m_k
+    rgb[:, :, 1] -= np.where(mm, v, 0)
+
+    return np.clip(rgb, 0, 1)
 
 
-def _make_gif(
+def _make_heatmap_grid(
     data: Dict[int, np.ndarray],
     mask_data: Dict[int, np.ndarray],
     t_vals: Dict[int, float],
     prompt_len: int,
-    title_prefix: str,
-    cmap: str,
+    title: str,
     out_path: str,
-    fps: int = 8,
 ) -> None:
-    try:
-        from PIL import Image
-    except ImportError:
-        print(f"  pillow not installed — skipping {os.path.basename(out_path)}")
-        return
-
     import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
+    import matplotlib.patches as mpatches
 
     steps = sorted(data.keys())
     resp_frames = [_resp(data[s], prompt_len) for s in steps]
     vmax = max(f.max() for f in resp_frames) or 1.0
     L = resp_frames[0].shape[0]
-    tick_step = max(32, L // 8)
+
+    n = len(steps)
+    n_cols = min(5, n)
+    n_rows = math.ceil(n / n_cols)
+    tick_step = max(32, L // 4)
     ticks = list(range(0, L, tick_step))
 
-    pil_frames = []
-    for i, step in enumerate(steps):
-        arr = resp_frames[i]
-        mask = mask_data[step][prompt_len:]   # (L,) bool — response positions
-        n_masked = int(mask.sum())
-        r_t = t_vals[step]
-
-        fig = plt.figure(figsize=(6.5, 7.5))
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 22], hspace=0.03)
-
-        # Top strip: mask indicator for key/query positions (same tokens on both axes)
-        ax_strip = fig.add_subplot(gs[0])
-        ax_strip.imshow(
-            mask[None, :].astype(np.float32),
-            aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1, interpolation="none",
-        )
-        ax_strip.set_xticks([])
-        ax_strip.set_yticks([0])
-        ax_strip.set_yticklabels(["[MASK]"], fontsize=6)
-        ax_strip.set_title(
-            f"{title_prefix}\nstep {step}   r_t={r_t:.3f}   {n_masked}/{L} masked",
-            fontsize=8,
-        )
-
-        # Main heatmap: response × response
-        ax = fig.add_subplot(gs[1])
-        im = ax.imshow(arr, aspect="auto", cmap=cmap, vmin=0, vmax=vmax, interpolation="nearest")
-        ax.set_xticks(ticks)
-        ax.set_xticklabels(ticks, fontsize=6)
-        ax.set_yticks(ticks)
-        ax.set_yticklabels(ticks, fontsize=6)
-        ax.set_xlabel("Key (response position)", fontsize=7)
-        ax.set_ylabel("Query (response position)", fontsize=7)
-        fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-
-        pil_frames.append(_fig_to_pil(fig))
-        plt.close(fig)
-
-    pil_frames[0].save(
-        out_path,
-        save_all=True,
-        append_images=pil_frames[1:],
-        duration=1000 // fps,
-        loop=0,
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(3.2 * n_cols, 3.5 * n_rows + 0.6),
+        squeeze=False,
     )
-    print(f"  {os.path.basename(out_path)}: {len(pil_frames)} frames @ {fps} fps")
+
+    for idx, step in enumerate(steps):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row][col]
+
+        mask = mask_data[step][prompt_len:]   # (L,) bool
+        rgb = _render_quadrant_heatmap(resp_frames[idx], mask, vmax)
+
+        ax.imshow(rgb, aspect="auto", origin="upper", interpolation="nearest")
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(ticks, fontsize=5)
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(ticks, fontsize=5)
+        ax.set_xlabel("Key pos", fontsize=5)
+        ax.set_ylabel("Query pos", fontsize=5)
+        ax.set_title(
+            f"step {step}  r_t={t_vals[step]:.2f}\n{int(mask.sum())}/{L} masked",
+            fontsize=6,
+        )
+
+    # Hide unused axes
+    for idx in range(n, n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].set_visible(False)
+
+    # Colour legend
+    legend_patches = [
+        mpatches.Patch(color="blue",    label="real → real"),
+        mpatches.Patch(color="red",     label="real → [MASK]  ← suppressed"),
+        mpatches.Patch(color="green",   label="[MASK] → real"),
+        mpatches.Patch(color="magenta", label="[MASK] → [MASK]  ← μ-suppressed"),
+    ]
+    fig.legend(
+        handles=legend_patches,
+        loc="lower center",
+        ncol=4,
+        fontsize=7,
+        bbox_to_anchor=(0.5, 0.0),
+        framealpha=0.9,
+    )
+
+    fig.suptitle(title, fontsize=10, y=1.01)
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  {os.path.basename(out_path)}: {n} panels ({n_rows}×{n_cols} grid)")
 
 
 def _plot_confidence(
     conf_data: Dict[int, np.ndarray],
-    mask_data: Dict[int, np.ndarray],
-    prompt_len: int,
+    t_vals: Dict[int, float],
     out_path: str,
 ) -> None:
     import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    from matplotlib.colors import Normalize
 
     steps = sorted(conf_data.keys())
     L = len(conf_data[steps[0]])
-    cmap = plt.get_cmap("plasma")
     xs = np.arange(L)
 
+    norm = Normalize(vmin=steps[0], vmax=steps[-1])
+    cmap = cm.plasma
+
     fig, ax = plt.subplots(figsize=(13, 4))
-    for i, step in enumerate(steps):
-        color = cmap(i / max(len(steps) - 1, 1))
-        ax.plot(xs, conf_data[step], color=color, linewidth=0.9, alpha=0.85, label=f"step {step}")
+    for step in steps:
+        color = cmap(norm(step))
+        ax.plot(xs, conf_data[step], color=color, linewidth=0.8, alpha=0.85)
 
     ax.axhline(1.0, color="gray", linewidth=0.6, linestyle="--", alpha=0.5)
     ax.set_xlim(0, L - 1)
     ax.set_ylim(-0.02, 1.08)
     ax.set_xlabel("Response position")
     ax.set_ylabel("Confidence")
-    ax.set_title("Token confidence per response position  (light → dark = early → late steps)")
-    ax.legend(fontsize=6, ncol=max(1, len(steps) // 2), loc="lower right")
+    ax.set_title(
+        f"Token confidence per position — every {steps[1] - steps[0] if len(steps) > 1 else '?'} steps"
+        "  (light = early, dark = late)"
+    )
+
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label="Denoising step", fraction=0.02, pad=0.01)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  confidence.png saved")
+    print(f"  confidence.png saved  ({len(steps)} lines)")
 
 
 def _plot_scalar(
@@ -321,10 +365,10 @@ def _plot_scalar(
     r_ts: List[float] = []
 
     for step in steps:
-        attn = attn_data[step]           # (S, S)
-        mask = mask_data[step]            # (S,) bool
-        attn_resp = attn[prompt_len:]    # (L, S) — response queries only
-        mask_resp = mask[prompt_len:]    # (L,) bool
+        attn = attn_data[step]
+        mask = mask_data[step]
+        attn_resp = attn[prompt_len:]     # (L, S) — response queries
+        mask_resp = mask[prompt_len:]     # (L,) bool
         real_resp = ~mask_resp
         if real_resp.any() and mask.any():
             val = float(attn_resp[real_resp, :][:, mask].mean())
@@ -345,7 +389,6 @@ def _plot_scalar(
     )
     ax.set_ylim(bottom=0)
 
-    # Secondary x-axis showing r_t
     ax2 = ax.twiny()
     ax2.set_xlim(ax.get_xlim())
     sampled = steps[:: max(1, len(steps) // 6)]

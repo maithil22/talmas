@@ -104,9 +104,12 @@ def low_confidence_remasking_sample(
         n_unmask = max(0, min(n_unmask, L))
 
         # Select the n_unmask positions with the highest confidence.
-        # stable=True breaks ties by input order, eliminating non-determinism
-        # from bfloat16 probability ties across runs.
-        _, top_indices = torch.topk(confidence, k=n_unmask, largest=True, stable=True)
+        # Tiebreak by position (earlier index wins) to make selection deterministic
+        # when bfloat16 rounds two probabilities to the same value.  The penalty
+        # (1e-7 * position) is far below bfloat16 resolution (~0.008), so it never
+        # affects genuine confidence rankings.
+        tiebreak = torch.arange(L, device=device, dtype=torch.float32) * 1e-7
+        _, top_indices = torch.topk(confidence.float() - tiebreak, k=n_unmask, largest=True)
         new_response = torch.full((L,), mask_token_id, dtype=torch.long, device=device)
         new_response[top_indices] = pred_ids[top_indices]
 

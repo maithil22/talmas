@@ -164,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=str, default="results/viz", dest="output_dir")
     p.add_argument("--capture-attn-every", type=int, default=10, dest="capture_attn_every",
                    help="Capture attention/suppression every N steps (GIF frames)")
-    p.add_argument("--capture-conf-every", type=int, default=50, dest="capture_conf_every",
+    p.add_argument("--capture-conf-every", type=int, default=10, dest="capture_conf_every",
                    help="Record confidence every N steps (lines in confidence.png)")
 
     talmas = p.add_argument_group("TALMAS options")
