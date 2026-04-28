@@ -25,12 +25,16 @@ def low_confidence_remasking_sample(
     mask_token_id: int,
     eos_token_id: int,
     hook_manager=None,                 # TALMASHookManager | None
+    diagnostics=None,                  # DiagnosticsCollector | None
 ) -> torch.Tensor:
     """
     Pure diffusion sampling with low-confidence remasking (Algorithm 5).
 
     If hook_manager is provided, its state is updated at each diffusion step
     so that TALMAS logit biases are applied during the forward pass.
+
+    If diagnostics is provided, it receives begin_step / end_step calls each
+    iteration so attention weights, confidence, and suppression can be captured.
 
     Returns the generated token ids as a 1-D tensor (response only).
     """
@@ -53,12 +57,16 @@ def low_confidence_remasking_sample(
         t_val = t.item()
 
         # -------------------------------------------------------------- #
-        # TALMAS: update hook state with current mask ratio and positions  #
-        # t_val IS r_t (fraction of tokens still masked at this step)      #
+        # TALMAS + diagnostics: compute mask positions once, shared by both#
         # -------------------------------------------------------------- #
+        needs_mask = hook_manager is not None or diagnostics is not None
+        mask_positions = (input_ids == mask_token_id) if needs_mask else None  # (1, S)
+
         if hook_manager is not None:
-            mask_positions = (input_ids == mask_token_id)  # (1, prompt_len+L)
             hook_manager.set_state(r_t=t_val, mask_positions=mask_positions)
+
+        if diagnostics is not None:
+            diagnostics.begin_step(i, t_val, mask_positions)
 
         # -------------------------------------------------------------- #
         # Step 2 — forward pass: predict all masked tokens simultaneously #
@@ -86,8 +94,10 @@ def low_confidence_remasking_sample(
         current_response = input_ids[0, prompt_len:]  # (L,)
         already_unmasked  = (current_response != mask_token_id)
         confidence = confidence.masked_fill(already_unmasked, 1.0)
-        # TODO: Print confidence values for every token for every 10 denoising steps
         pred_ids   = torch.where(already_unmasked, current_response, pred_ids)
+
+        if diagnostics is not None:
+            diagnostics.end_step(i, confidence)
 
         # Number of tokens that should be unmasked at time s
         n_unmask = math.floor(L * (1.0 - s))
