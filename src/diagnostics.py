@@ -40,11 +40,13 @@ class DiagnosticsCollector:
         num_layers: int,
         capture_attn_every: int = 10,
         capture_conf_every: int = 10,
+        debug_step: Optional[int] = None,
     ):
         self.talmas_cfg = talmas_cfg
         self.num_layers = num_layers
         self.capture_attn_every = capture_attn_every
         self.capture_conf_every = capture_conf_every
+        self.debug_step = debug_step
 
         # Per-step storage
         self._attn: Dict[int, np.ndarray] = {}   # step → (S, S) mean-over-heads
@@ -54,6 +56,7 @@ class DiagnosticsCollector:
         self._t_vals: Dict[int, float] = {}       # step → r_t
 
         self._should_capture = False
+        self._current_step: int = -1
         self._latest_attn: Optional[np.ndarray] = None
         self._last_block = None
         self._orig_fwd = None
@@ -88,16 +91,34 @@ class DiagnosticsCollector:
             def capturing_sdpa(query, key, value, attn_mask=None, **kw):
                 # Call real F.sdpa so model output is unchanged
                 out = old_sdpa(query, key, value, attn_mask=attn_mask, **kw)
-                # Recompute attention weights separately for visualization only
+                # Recompute attention logits and weights for visualization/debug only
                 scale = query.shape[-1] ** -0.5
                 with torch.no_grad():
-                    logits = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
-                    if attn_mask is not None:
-                        logits = logits + attn_mask.float()
-                    weights = torch.softmax(logits, dim=-1)      # (B, H, S, S)
+                    raw_logits = (
+                        torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
+                    )  # (B, H, S, S) — no bias
+                    biased_logits = (
+                        raw_logits + attn_mask.float()
+                        if attn_mask is not None
+                        else raw_logits
+                    )  # (B, H, S, S) — with causal + TALMAS bias
+                    weights_raw    = torch.softmax(raw_logits,    dim=-1)
+                    weights_biased = torch.softmax(biased_logits, dim=-1)
+
+                    # Normal capture path (biased weights, mean over heads)
                     captured.append(
-                        weights.mean(dim=1)[0].cpu().numpy().astype(np.float32)  # (S, S)
+                        weights_biased.mean(dim=1)[0].cpu().numpy().astype(np.float32)
                     )
+
+                    # Debug print when the user requested a specific step
+                    if collector._current_step == collector.debug_step:
+                        mask = collector._mask.get(collector._current_step)
+                        t_val = collector._t_vals.get(collector._current_step, float("nan"))
+                        _print_attention_debug(
+                            raw_logits, biased_logits,
+                            weights_raw, weights_biased,
+                            mask, collector._current_step, t_val,
+                        )
                 return out
 
             F.scaled_dot_product_attention = capturing_sdpa
@@ -118,13 +139,14 @@ class DiagnosticsCollector:
 
     def begin_step(self, step_idx: int, t_val: float, mask_positions: torch.Tensor) -> None:
         """Call BEFORE the model forward pass. Arms attention capture and computes suppression."""
+        self._current_step = step_idx
         self._t_vals[step_idx] = t_val
         self._latest_attn = None
 
         m = mask_positions[0].cpu().numpy()   # (S,) bool
         self._mask[step_idx] = m
 
-        capture = (step_idx % self.capture_attn_every == 0)
+        capture = (step_idx % self.capture_attn_every == 0) or (step_idx == self.debug_step)
         self._should_capture = capture
 
         # Compute suppression bias analytically for the last layer at this step
@@ -184,6 +206,69 @@ class DiagnosticsCollector:
                 self._conf, self._t_vals,
                 out_path=os.path.join(output_dir, "confidence.png"),
             )
+
+
+# ---------------------------------------------------------------------------
+# Debug printer
+# ---------------------------------------------------------------------------
+
+def _print_attention_debug(
+    raw_logits: torch.Tensor,       # (B, H, S, S)  pre-softmax, no bias
+    biased_logits: torch.Tensor,    # (B, H, S, S)  pre-softmax, with bias
+    weights_raw: torch.Tensor,      # (B, H, S, S)  post-softmax, no bias
+    weights_biased: torch.Tensor,   # (B, H, S, S)  post-softmax, with bias
+    mask: Optional[np.ndarray],     # (S,) bool  True = [MASK] token, or None
+    step_idx: int,
+    t_val: float,
+) -> None:
+    # Mean over batch and heads → (S, S)
+    rl = raw_logits.mean(dim=(0, 1)).cpu().float().numpy()
+    bl = biased_logits.mean(dim=(0, 1)).cpu().float().numpy()
+    wr = weights_raw.mean(dim=(0, 1)).cpu().float().numpy()
+    wb = weights_biased.mean(dim=(0, 1)).cpu().float().numpy()
+
+    S = rl.shape[0]
+    m = mask.astype(bool) if mask is not None else np.zeros(S, dtype=bool)
+    r = ~m
+
+    # query axis = row (dim 0), key axis = col (dim 1)
+    m_q = m[:, np.newaxis]   # (S, 1)
+    m_k = m[np.newaxis, :]   # (1, S)
+    r_q = r[:, np.newaxis]
+    r_k = r[np.newaxis, :]
+
+    quadrants = [
+        ("real  → real  ", r_q & r_k),
+        ("real  → [MASK]", r_q & m_k),
+        ("[MASK] → real  ", m_q & r_k),
+        ("[MASK] → [MASK]", m_q & m_k),
+    ]
+
+    def stats(arr: np.ndarray, sel: np.ndarray) -> str:
+        vals = arr[sel]
+        if vals.size == 0:
+            return "        n/a        "
+        return f"mean={vals.mean():+8.4f}  max={vals.max():+8.4f}"
+
+    n_mask = int(m.sum())
+    n_real = int(r.sum())
+    print(f"\n{'='*80}")
+    print(f"Attention debug — step {step_idx}  r_t={t_val:.4f}  "
+          f"last layer  ({n_real} real / {n_mask} [MASK] tokens, S={S})")
+    print(f"{'='*80}")
+    hdr = f"{'Quadrant':<22}  {'pre-softmax w/o bias':^35}  {'pre-softmax w/ bias':^35}"
+    print(hdr)
+    print("-" * len(hdr))
+    for name, sel in quadrants:
+        print(f"  {name}    {stats(rl, sel)}    {stats(bl, sel)}")
+
+    print()
+    hdr2 = f"{'Quadrant':<22}  {'post-softmax w/o bias':^35}  {'post-softmax w/ bias':^35}"
+    print(hdr2)
+    print("-" * len(hdr2))
+    for name, sel in quadrants:
+        print(f"  {name}    {stats(wr, sel)}    {stats(wb, sel)}")
+    print(f"{'='*80}\n")
 
 
 # ---------------------------------------------------------------------------
