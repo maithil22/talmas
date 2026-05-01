@@ -154,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="TALMAS diagnostics visualization on one GSM8K example",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
+    p.add_argument("--model", default="GSAI-ML/LLaDA-8B-Base")
     p.add_argument("--index", type=int, default=0,
                    help="GSM8K test set example index")
     p.add_argument("--steps", type=int, default=64,
