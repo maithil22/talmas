@@ -114,6 +114,7 @@ def main(args) -> None:
         model, talmas_cfg, num_layers,
         capture_attn_every=args.capture_attn_every,
         capture_conf_every=args.capture_conf_every,
+        debug_step=args.debug_step,
     )
 
     # ------------------------------------------------------------------ #
@@ -166,6 +167,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Capture attention/suppression every N steps (GIF frames)")
     p.add_argument("--capture-conf-every", type=int, default=10, dest="capture_conf_every",
                    help="Record confidence every N steps (lines in confidence.png)")
+    p.add_argument("--debug-step", type=int, default=None, dest="debug_step",
+                   help="Print raw attention values (pre/post softmax, w/ and w/o suppression) "
+                        "at this denoising step index (0-based)")
 
     talmas = p.add_argument_group("TALMAS options")
     talmas.add_argument("--talmas", action="store_true",
