@@ -106,7 +106,7 @@ def main(args) -> None:
     # ------------------------------------------------------------------ #
     hook_manager = None
     if talmas_cfg is not None and talmas_cfg.lambda_max > 0.0:
-        hook_manager = TALMASHookManager(model, talmas_cfg)
+        hook_manager = TALMASHookManager(model, talmas_cfg, debug_step=args.debug_step)
 
     # DiagnosticsCollector must be installed AFTER TALMASHookManager so its
     # capturing_fwd wraps the already-patched block forward.
@@ -166,6 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Capture attention/suppression every N steps (GIF frames)")
     p.add_argument("--capture-conf-every", type=int, default=10, dest="capture_conf_every",
                    help="Record confidence every N steps (lines in confidence.png)")
+    p.add_argument("--debug-step", type=int, default=None, dest="debug_step",
+                   help="Print raw attention values (pre/post softmax, w/ and w/o suppression) "
+                        "at this denoising step index (0-based)")
 
     talmas = p.add_argument_group("TALMAS options")
     talmas.add_argument("--talmas", action="store_true",

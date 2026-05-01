@@ -19,6 +19,7 @@ Suppression regime:
 import functools
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -79,13 +80,16 @@ class TALMASHookManager:
         manager.remove()
     """
 
-    def __init__(self, model, cfg: TALMASConfig):
+    def __init__(self, model, cfg: TALMASConfig, debug_step: Optional[int] = None):
         self.model = model
         self.cfg = cfg
+        self.debug_step = debug_step
 
         # Runtime state — updated each diffusion step via set_state()
         self.r_t: float = 1.0
+        self.step_idx: int = 0
         self.mask_positions: Optional[torch.Tensor] = None  # (batch, seq_len) bool
+        self._debug_done: bool = False  # fire at most once per run
 
         self._patched = []                              # list of (module, original_forward)
         self.num_layers = self._count_layers()
@@ -140,6 +144,22 @@ class TALMASHookManager:
                     else:
                         attention_bias = talmas_bias
 
+                    # Debug: capture attention values before and after suppression
+                    # Fires once at the requested step, last layer only.
+                    should_debug = (
+                        not manager._debug_done
+                        and manager.debug_step is not None
+                        and manager.step_idx == manager.debug_step
+                        and layer_idx == manager.num_layers - 1
+                    )
+                    if should_debug:
+                        _capture_and_print_debug(
+                            original_forward, x, attention_bias,
+                            manager.mask_positions, manager.step_idx, manager.r_t, lam,
+                            **kwargs,
+                        )
+                        manager._debug_done = True
+
             return original_forward(x, attention_bias=attention_bias, **kwargs)
 
         block_module.forward = patched_forward
@@ -153,9 +173,10 @@ class TALMASHookManager:
                 self._patch_attention(module, layer_idx)
                 layer_idx += 1
 
-    def set_state(self, r_t: float, mask_positions: torch.Tensor) -> None:
+    def set_state(self, r_t: float, mask_positions: torch.Tensor, step_idx: int = 0) -> None:
         """Call once per diffusion step before the forward pass."""
         self.r_t = r_t
+        self.step_idx = step_idx
         self.mask_positions = mask_positions
 
     def remove(self) -> None:
@@ -164,3 +185,112 @@ class TALMASHookManager:
             block_module.forward = original_forward
         self._patched.clear()
         self.mask_positions = None
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
+
+def _capture_and_print_debug(
+    original_forward,
+    x: torch.Tensor,
+    attention_bias_with_talmas,   # already has talmas_bias added
+    mask_positions: torch.Tensor, # (B, S) bool
+    step_idx: int,
+    r_t: float,
+    lam: float,
+    **kwargs,
+) -> None:
+    """
+    Run one extra forward pass through the last block with F.sdpa patched to
+    capture raw logits and attention weights both with and without the TALMAS
+    bias.  The extra pass is inference-mode only and its output is discarded.
+    """
+    debug: dict = {}
+    old_sdpa = F.scaled_dot_product_attention
+
+    def _capturing_sdpa(query, key, value, attn_mask=None, **kw):
+        out = old_sdpa(query, key, value, attn_mask=attn_mask, **kw)
+        scale = query.shape[-1] ** -0.5
+        with torch.no_grad():
+            raw_logits = (
+                torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
+            )  # (B, H, S, S)  — pure QK, no bias at all
+            biased_logits = (
+                raw_logits + attn_mask.float() if attn_mask is not None else raw_logits
+            )  # (B, H, S, S)  — with causal + TALMAS bias
+            debug["raw_logits"]    = raw_logits.cpu()
+            debug["biased_logits"] = biased_logits.cpu()
+            debug["weights_raw"]   = torch.softmax(raw_logits,    dim=-1).cpu()
+            debug["weights_biased"]= torch.softmax(biased_logits, dim=-1).cpu()
+        return out
+
+    F.scaled_dot_product_attention = _capturing_sdpa
+    try:
+        with torch.no_grad():
+            original_forward(x, attention_bias=attention_bias_with_talmas, **kwargs)
+    finally:
+        F.scaled_dot_product_attention = old_sdpa
+
+    if debug:
+        _print_attention_debug(
+            debug["raw_logits"], debug["biased_logits"],
+            debug["weights_raw"], debug["weights_biased"],
+            mask_positions[0].cpu().numpy(), step_idx, r_t, lam,
+        )
+
+
+def _print_attention_debug(
+    raw_logits: torch.Tensor,       # (B, H, S, S)  pre-softmax, no bias
+    biased_logits: torch.Tensor,    # (B, H, S, S)  pre-softmax, with causal + TALMAS bias
+    weights_raw: torch.Tensor,      # (B, H, S, S)  post-softmax, no bias
+    weights_biased: torch.Tensor,   # (B, H, S, S)  post-softmax, with bias
+    mask: np.ndarray,               # (S,) bool  True = [MASK] token
+    step_idx: int,
+    r_t: float,
+    lam: float,
+) -> None:
+    # Mean over batch and heads → (S, S)
+    rl = raw_logits.mean(dim=(0, 1)).float().numpy()
+    bl = biased_logits.mean(dim=(0, 1)).float().numpy()
+    wr = weights_raw.mean(dim=(0, 1)).float().numpy()
+    wb = weights_biased.mean(dim=(0, 1)).float().numpy()
+
+    S = rl.shape[0]
+    m = mask.astype(bool)
+    r = ~m
+    m_q, m_k = m[:, np.newaxis], m[np.newaxis, :]
+    r_q, r_k = r[:, np.newaxis], r[np.newaxis, :]
+
+    quadrants = [
+        ("real  → real  ", r_q & r_k),
+        ("real  → [MASK]", r_q & m_k),
+        ("[MASK] → real  ", m_q & r_k),
+        ("[MASK] → [MASK]", m_q & m_k),
+    ]
+
+    def stats(arr: np.ndarray, sel: np.ndarray) -> str:
+        vals = arr[sel]
+        if vals.size == 0:
+            return "           n/a           "
+        return f"mean={vals.mean():+9.4f}  max={vals.max():+9.4f}"
+
+    W = 92
+    print(f"\n{'='*W}")
+    print(f"TALMAS attention debug — step {step_idx}  r_t={r_t:.4f}  λ={lam:.4f}  "
+          f"last layer  ({int(r.sum())} real / {int(m.sum())} [MASK], S={S})")
+    print(f"{'='*W}")
+
+    hdr = f"  {'Quadrant':<18}  {'pre-softmax (no bias)':^27}  {'pre-softmax (w/ suppression)':^27}"
+    print(hdr)
+    print(f"  {'-'*18}  {'-'*27}  {'-'*27}")
+    for name, sel in quadrants:
+        print(f"  {name:<18}  {stats(rl, sel)}  {stats(bl, sel)}")
+
+    print()
+    hdr2 = f"  {'Quadrant':<18}  {'post-softmax (no bias)':^27}  {'post-softmax (w/ suppression)':^27}"
+    print(hdr2)
+    print(f"  {'-'*18}  {'-'*27}  {'-'*27}")
+    for name, sel in quadrants:
+        print(f"  {name:<18}  {stats(wr, sel)}  {stats(wb, sel)}")
+    print(f"{'='*W}\n")

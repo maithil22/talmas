@@ -63,7 +63,7 @@ def low_confidence_remasking_sample(
         mask_positions = (input_ids == mask_token_id) if needs_mask else None  # (1, S)
 
         if hook_manager is not None:
-            hook_manager.set_state(r_t=t_val, mask_positions=mask_positions)
+            hook_manager.set_state(r_t=t_val, mask_positions=mask_positions, step_idx=i)
 
         if diagnostics is not None:
             diagnostics.begin_step(i, t_val, mask_positions)
