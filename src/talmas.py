@@ -272,25 +272,25 @@ def _print_attention_debug(
     def stats(arr: np.ndarray, sel: np.ndarray) -> str:
         vals = arr[sel]
         if vals.size == 0:
-            return "           n/a           "
-        return f"mean={vals.mean():+9.4f}  max={vals.max():+9.4f}"
+            return "                  n/a                  "
+        return f"mean={vals.mean():+10.6f}  max={vals.max():+10.6f}"
 
-    W = 92
+    W = 104
     print(f"\n{'='*W}")
     print(f"TALMAS attention debug — step {step_idx}  r_t={r_t:.4f}  λ={lam:.4f}  "
           f"last layer  ({int(r.sum())} real / {int(m.sum())} [MASK], S={S})")
     print(f"{'='*W}")
 
-    hdr = f"  {'Quadrant':<18}  {'pre-softmax (no bias)':^27}  {'pre-softmax (w/ suppression)':^27}"
+    hdr = f"  {'Quadrant':<18}  {'pre-softmax (no bias)':^39}  {'pre-softmax (w/ suppression)':^39}"
     print(hdr)
-    print(f"  {'-'*18}  {'-'*27}  {'-'*27}")
+    print(f"  {'-'*18}  {'-'*39}  {'-'*39}")
     for name, sel in quadrants:
         print(f"  {name:<18}  {stats(rl, sel)}  {stats(bl, sel)}")
 
     print()
-    hdr2 = f"  {'Quadrant':<18}  {'post-softmax (no bias)':^27}  {'post-softmax (w/ suppression)':^27}"
+    hdr2 = f"  {'Quadrant':<18}  {'post-softmax (no bias)':^39}  {'post-softmax (w/ suppression)':^39}"
     print(hdr2)
-    print(f"  {'-'*18}  {'-'*27}  {'-'*27}")
+    print(f"  {'-'*18}  {'-'*39}  {'-'*39}")
     for name, sel in quadrants:
         print(f"  {name:<18}  {stats(wr, sel)}  {stats(wb, sel)}")
     print(f"{'='*W}\n")
