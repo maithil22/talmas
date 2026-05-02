@@ -10,9 +10,12 @@ import math
 from typing import Optional
 
 import torch
+import logging
 import torch.nn.functional as F
 
 from src.config import SamplingConfig
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 @torch.inference_mode()
@@ -122,3 +125,55 @@ def low_confidence_remasking_sample(
         final = final[: eos_positions[0]]
 
     return final
+
+def perform_sampling_step(model, input_ids, mask_positions, config, step):
+    """
+    Example representation of the sampling step inside your generation loop.
+    """
+    # 1. Forward pass to get base logits
+    outputs = model(input_ids)
+    logits = outputs.logits
+    
+    if config.use_pcg:
+        if config.debug_logs and step % 10 == 0:
+            logger.info(f"--- Step {step} | PCG ACTIVE ---")
+            
+        # A. Classifier-Free Guidance (CFG) via Position Uncertainty
+        # Calculate mean across the sequence length (dim=1)
+        mean_logits = logits.mean(dim=1, keepdim=True)
+        
+        # Log to verify the shape is broadcastable (Batch, 1, Vocab)
+        if config.debug_logs and step % 10 == 0:
+            logger.info(f"Base logits shape: {logits.shape}, Mean logits shape: {mean_logits.shape}")
+            logger.info(f"Sample logit variance before CFG: {logits.var().item():.4f}")
+            
+        # Push logits away from the mean position-agnostic distribution
+        logits = logits + config.pcg_cfg_weight * (logits - mean_logits)
+        
+        if config.debug_logs and step % 10 == 0:
+            logger.info(f"Sample logit variance after CFG (Weight {config.pcg_cfg_weight}): {logits.var().item():.4f}")
+
+    # 2. Calculate probabilities and confidence
+    probs = torch.softmax(logits, dim=-1)
+    confidence, predictions = torch.max(probs, dim=-1)
+
+    if config.use_pcg:
+        # B. Soft Left-to-Right (SLR) Bias
+        seq_len = confidence.shape[1]
+        position_penalty = torch.arange(seq_len, device=confidence.device).float() / seq_len
+        
+        # Scale penalty by SLR weight
+        scaled_penalty = config.pcg_slr_weight * position_penalty.unsqueeze(0)
+        
+        if config.debug_logs and step % 10 == 0:
+            logger.info(f"SLR Penalty | Min: {scaled_penalty.min().item():.4f}, Max: {scaled_penalty.max().item():.4f}")
+            logger.info(f"Avg Confidence BEFORE SLR: {confidence.mean().item():.4f}")
+            
+        # Apply penalty to confidence scores (penalizes tokens further to the right)
+        confidence = confidence - scaled_penalty
+        
+        if config.debug_logs and step % 10 == 0:
+            logger.info(f"Avg Confidence AFTER SLR: {confidence.mean().item():.4f}")
+
+    # ... [Rest of your original code: sort `confidence`, pick bottom N%, and remask] ...
+    # return updated_input_ids

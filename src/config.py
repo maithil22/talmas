@@ -15,6 +15,11 @@ class SamplingConfig:
     steps: int                   # number of reverse diffusion steps (N)
     zero_eos_confidence: bool    # set EOS confidence=0 (needed for instruct model)
     few_shot: int = 4            # number of few-shot examples
+    # --- PCG Parameters ---
+    use_pcg: bool = False
+    pcg_cfg_weight: float = 1.5
+    pcg_slr_weight: float = 0.1
+    debug_logs: bool = False  # Set to True via CLI to see math transformations
 
 
 BASE_CONFIG = SamplingConfig(

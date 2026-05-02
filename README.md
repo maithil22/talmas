@@ -262,3 +262,16 @@ Defaults for `generation_length` and `steps` are `1024` for base models and `512
 | Accuracy identical across μ values | μ sweep not creating new hook managers | Each config in `run_ablation.py` creates a fresh `TALMASHookManager`; check for exception output |
 | `logits` shape error | LLaDA output object changed | Access via `model(...).logits`; inspect return type with a single forward pass |
 | Spot VM preempted, progress lost | No checkpoint file specified | Always pass `--checkpoint results/ckpt.jsonl`; restart with the same command to resume |
+
+
+## PCG TESTING
+
+-- Run just 2 samples with --debug-logs enabled.
+
+    python3 -m scripts.gsm8k_eval_pcg --model GSAI-ML/LLaDA-8B-Base --pcg --pcg-cfg-weight 1.5 --pcg-slr-weight 0.1 --max_samples 2 --debug-logs --output-dir ./results/test2
+-- Run the Full Comparison:
+    Baseline:
+        python scripts/gsm8k_eval.py --model GSAI-ML/LLaDA-8B-Base --max_samples 100
+    PCG:
+        python scripts/gsm8k_eval.py --model GSAI-ML/LLaDA-8B-Base --pcg --pcg-cfg-weight 1.5 --pcg-slr-weight 0.1 --max_samples 100
+
