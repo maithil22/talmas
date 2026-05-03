@@ -1,4 +1,4 @@
-results/
+# results/
 __pycache__/
 *.pyc
 *.pyo
@@ -8,5 +8,5 @@ __pycache__/
 dist/
 build/
 *.json
-!results/.gitkeep
+# !results/.gitkeep
 CLAUDE.md
