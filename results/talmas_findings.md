@@ -6,7 +6,9 @@
 
 ## TL;DR
 
-TALMAS gives a **+1.44 percentage point** accuracy gain over the LLaDA-8B-Base baseline on GSM8K (73.77% vs 72.33%) with the default config (λ=4.0, μ=0.1). The improvement is real but uneven: TALMAS fixes 47 baseline errors while introducing 28 new ones. The pattern is clear — TALMAS helps when problems require tracking multiple entities or accumulating across steps, and hurts when it causes output degeneration (repetition loops, truncation before the final answer) or inserts spurious arithmetic steps in long chains. A hyperparameter sweep over 25 configs suggests the default μ=0.1 is suboptimal: **μ=0.5 consistently tops the sweep** at n=300–500 across all λ values, and may push the full-scale number closer to 75–76% if confirmed.
+TALMAS gives a **+1.44 percentage point** accuracy gain over the LLaDA-8B-Base baseline on GSM8K (73.77% vs 72.33%) with the default config (λ=4.0, μ=0.1). The improvement is real but uneven: TALMAS fixes 47 baseline errors while introducing 28 new ones. The pattern is clear — TALMAS helps when problems require tracking multiple entities or accumulating across steps, and hurts when it causes output degeneration (repetition loops, truncation before the final answer) or inserts spurious arithmetic steps in long chains. A hyperparameter sweep over 25 configs suggested μ=0.5 might push to 75–76%, but a full-scale run (λ=6.0, μ=0.5, n=1319) came in at **73.24%** — statistically tied with the μ=0.1 baseline. The partial-run sweep advantage was noise. **The best confirmed result remains 73.77% (λ=4.0, μ=0.1).**
+
+Follow-up generation-length experiments confirmed that GL=128 hurts accuracy by ~5pp (68.4% at n=500), and extreme μ=4.0 is destructive (66.11%). The primary open direction is addressing the **repetition loop failure mode** through a timestep ceiling or PCG.
 
 ---
 
@@ -295,12 +297,67 @@ Compared to the default run (λ=4.0, μ=0.1) which achieves 73.8% at n=1319, thi
 
 ---
 
+## Generation Length Experiments
+
+Four follow-up runs tested reduced generation length (GL=128) and extreme μ values. All results in `results/talnew/`.
+
+| Config | GL | n | Accuracy | Notes |
+|---|---|---|---|---|
+| λ=4.0, μ=4.0, no layer gate | 256 | 1319 | **66.11%** | μ too large — destroys performance |
+| λ=4.0, μ=0.5, layer gate on | **128** | 500 | **68.40%** | GL too short |
+| λ=6.0, μ=0.5, layer gate on | **128** | 500 | **68.40%** | Same as above — λ irrelevant at GL=128 |
+| λ=6.0, μ=0.5, layer gate on | 256 | 1319 | **73.24%** | Matches μ=0.1 baseline within noise |
+
+**Finding 1: GL=128 is too short.** Both GL=128 runs land at 68.40% regardless of λ — about 5pp below the full-scale results. The model needs the full 256-token budget to complete multi-step reasoning chains before the `####` answer line. The bottleneck is output budget, not suppression scale.
+
+**Finding 2: μ=4.0 is destructive.** Extreme mask-to-mask suppression (μ=4.0) drops to 66.11%, 6pp below baseline. The usable range is μ ≤ 1.0; at μ=4.0, mask tokens can barely attend to each other, breaking coordination across unrevealed positions entirely.
+
+**Finding 3: μ=0.5 at full scale does not beat μ=0.1.** The sweep's partial-run signal (77.3–77.7% at n=300) was noise. At n=1319, λ=6.0, μ=0.5 gives 73.24% vs the previous best 73.77% — a gap of 0.53pp, well within the ±1.4pp SE at this sample size. The default μ=0.1 config remains the best confirmed result.
+
+---
+
 ## Open Questions
 
-1. **Run λ=4.0, μ=0.5 at full scale** — the sweep strongly suggests μ=0.5 outperforms μ=0.1 across multiple λ values. A single full-run comparison would confirm whether the sweep signal holds at 1319 examples.
+1. ~~**Run λ=4.0, μ=0.5 at full scale**~~ → **Answered (May 4):** λ=6.0, μ=0.5 gives 73.24% at n=1319. No significant gain over μ=0.1 (73.77%). Sweep signal was noise.
 
-2. **Generation length and repetition loops** — repetition loop failures concentrate in longer outputs. If the model is given a fixed 256-token budget, TALMAS at late timesteps may be over-constraining near the end. Testing with shorter generation lengths (128) would show whether loop failures disappear.
+2. ~~**Generation length and repetition loops**~~ → **Answered (May 4):** GL=128 gives 68.4% — the model needs the full 256-token budget. Short generation does not eliminate loops; it just truncates before the answer.
 
 3. **Layer gate threshold** — the sigmoid layer gate centers at u=0.5. Shifting to u=0.65 would focus suppression on the top third of layers only, potentially reducing spurious-step failures that may originate from mid-depth layers.
 
 4. **What drives the ~24% both-wrong floor** — 318/1319 examples are wrong for both baseline and all TALMAS configs. Understanding whether these share a structural property (e.g. multi-hop division, large final answers) would clarify the ceiling for this class of intervention.
+
+5. **Timestep ceiling** — TALMAS suppression peaks at late timesteps (r_t ≈ 0), exactly when the model is writing its final answer. This is the direct cause of repetition loops: the model over-anchors on already-committed tokens and regenerates them instead of advancing. Applying a ceiling (turn off TALMAS when >85% of tokens are revealed) would let the model write its final answer freely.
+
+6. **λ=1.0, μ=0.5 at full scale** — the single highest partial-run result in the sweep (77.7% at n=300). Never confirmed at n=1319. Worth one full run before concluding that the sweep was entirely noise.
+
+7. **PCG evaluation** — Position-Controlled Generation (Soft Left-to-Right bias) was implemented in `src/sampling.py` but not yet evaluated. The SLR penalty discourages confidence at later positions during remasking, which may reduce repetition loops independently of TALMAS.
+
+---
+
+## What to Try Next
+
+### Priority 1 — Timestep ceiling (one-line change to `src/talmas.py`)
+
+Add a `max_suppression_ratio` parameter to the timestep gate so suppression is zeroed out when the fraction of revealed tokens exceeds a threshold (e.g. 0.85). This directly targets the repetition loop failure mode without touching anything else.
+
+```python
+# in the timestep gate function, after computing f(1 - r_t):
+if r_t < (1 - max_suppression_ratio):   # e.g. r_t < 0.15 → >85% revealed
+    gate = 0.0
+```
+
+Prediction: eliminates the repetition loop failures (streaming-service type) and reduces spurious-step errors, at a small cost to accumulation gains in long chains. Net effect likely positive given the 28 losses vs 47 gains ratio.
+
+### Priority 2 — Run λ=1.0, μ=0.5 at full scale
+
+The sweep's highest single point (77.7% at n=300). All other n=300 sweep results failed to replicate at n=1319, but this was the only config not yet confirmed. One run to close the loop.
+
+Command: `python scripts/gsm8k_eval.py --lambda_max 1.0 --mu 0.5 --timestep_gate --layer_gate`
+
+### Priority 3 — Layer gate threshold shift (u=0.65)
+
+Modify the layer gate sigmoid center in `src/config.py` from `u=0.5` to `u=0.65`. Focuses suppression on layers 20–31 (top third) rather than layers 16–31. Hypothesis: spurious arithmetic insertions originate in mid-depth layers (12–20) that currently receive partial suppression; tightening the gate may reduce those without harming the tracking benefit in deep layers.
+
+### Priority 4 — Evaluate PCG
+
+The PCG code in `src/sampling.py` is untested on GSM8K. Run a baseline PCG evaluation (no TALMAS) to establish whether the SLR bias alone helps, then test TALMAS+PCG stacked. If PCG reduces repetition loops independently, it may combine with TALMAS to cover more of the loss cases.

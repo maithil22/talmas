@@ -127,6 +127,8 @@ def evaluate(args) -> float:
     # ------------------------------------------------------------------ #
     print("Loading GSM8K dataset...")
     dataset = load_dataset("gsm8k", "main", split=args.split)
+    if args.start_index:
+        dataset = dataset.select(range(min(args.start_index, len(dataset)), len(dataset)))
     if args.max_samples:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
 
@@ -211,8 +213,9 @@ def evaluate(args) -> float:
 
             status = "✓" if is_correct else "✗"
             running_acc = correct / total * 100
+            display_idx = (args.start_index or 0) + total
             tqdm.write(
-                f"[{total:>4}] {status}  gold={str(gold_ans):<8}  pred={str(pred_ans):<8}  "
+                f"[{display_idx:>4}] {status}  gold={str(gold_ans):<8}  pred={str(pred_ans):<8}  "
                 f"running acc: {correct}/{total} ({running_acc:.1f}%)"
             )
             if args.verbose:
@@ -277,6 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="GSM8K split to evaluate on")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of examples (None = full 1319-example test set)")
+    parser.add_argument("--start_index", type=int, default=None,
+                        help="Skip this many examples from the start of the dataset (e.g. 500 to begin at example 501)")
     parser.add_argument("--generation_length", type=int, default=256,
                         help="Number of response tokens to generate")
     parser.add_argument("--steps", type=int, default=256,
