@@ -229,7 +229,8 @@ register_dataset(DatasetAdapter(
 
 
 # ---------------------------------------------------------------------------
-# MATH adapter  (lighteval/MATH — fields: problem, solution, answer, subject, level)
+# MATH adapter  (qwedsacf/competition_math — fields: problem, solution, level, type)
+# Only a 'train' split (12,500 rows). Answer embedded in 'solution' as \boxed{}.
 # ---------------------------------------------------------------------------
 
 _MATH_FEW_SHOT = """\
@@ -249,14 +250,14 @@ Solution: $\\binom{7}{3} = \\frac{7 \\times 6 \\times 5}{3!} = 35$. The answer i
 
 register_dataset(DatasetAdapter(
     name="math",
-    hf_path="lighteval/MATH",
-    hf_config="all",
+    hf_path="qwedsacf/competition_math",
+    hf_config=None,
     question_field="problem",
-    answer_field="answer",   # lighteval/MATH has a pre-extracted 'answer' field
+    answer_field="solution",  # answer embedded as \boxed{} inside the solution field
     few_shot_text=_MATH_FEW_SHOT,
-    default_split="test",
+    default_split="train",    # only split available
     extract_fn=extract_boxed_answer,
-    gold_extract_fn=lambda x: x.strip() if x else None,  # field is already clean
+    gold_extract_fn=extract_boxed_answer,
     match_fn=math_string_match,
     prompt_fn=_math_prompt,
 ))
