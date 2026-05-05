@@ -1,7 +1,7 @@
 """
-Unified GSM8K evaluation CLI — baseline and TALMAS mode.
+Unified evaluation CLI — baseline and TALMAS mode.
 
-Baseline usage (identical to llada_gsm8k_eval.py):
+Baseline usage:
   python scripts/gsm8k_eval.py --model GSAI-ML/LLaDA-8B-Base --max_samples 100
 
 TALMAS usage:
@@ -11,6 +11,12 @@ TALMAS usage:
       --lambda-max 4.0 \\
       --mu 0.1 \\
       --max_samples 100
+
+Run on MATH dataset:
+  python scripts/gsm8k_eval.py --dataset math --max_samples 50 --talmas
+
+Run on specific indices:
+  python scripts/gsm8k_eval.py --dataset gsm8k --indices 0,5,10,15,20
 
 Ablation (all 5 configs + μ sweep):
   python scripts/run_ablation.py --max-samples 100
@@ -27,20 +33,14 @@ from datetime import datetime
 from typing import Optional
 
 import torch
-from datasets import load_dataset
 from tqdm import tqdm
 
 # Allow running from the repo root without installing the package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.config import SamplingConfig, TALMASConfig, BASE_CONFIG, INSTRUCT_CONFIG
-from src.utils import (
-    build_prompt,
-    extract_answer,
-    answers_match,
-    resolve_special_tokens,
-    load_model_and_tokenizer,
-)
+from src.datasets import get_adapter, list_datasets, DATASET_REGISTRY
+from src.utils import resolve_special_tokens, load_model_and_tokenizer
 from src.sampling import low_confidence_remasking_sample
 from src.talmas import TALMASHookManager
 
@@ -69,12 +69,23 @@ def evaluate(args) -> float:
             sigmoid_slope=args.sigmoid_slope,
         )
 
+    dataset_name = getattr(args, "dataset", "gsm8k")
+    adapter = get_adapter(dataset_name)
+
+    indices = None
+    if getattr(args, "indices", None):
+        indices = [int(i) for i in args.indices.split(",")]
+
     print(f"Model:             {args.model}")
+    print(f"Dataset:           {dataset_name}")
     print(f"Mode:              {'Instruct' if is_instruct else 'Base'}")
     print(f"Generation length: {cfg.generation_length}")
     print(f"Sampling steps:    {cfg.steps}")
     print(f"Zero EOS conf:     {cfg.zero_eos_confidence}")
-    print(f"Samples:           {args.max_samples or 'all'}")
+    if indices is not None:
+        print(f"Indices:           {indices}")
+    else:
+        print(f"Samples:           {args.max_samples or 'all'}")
     if talmas_cfg:
         print(f"TALMAS:            λ_max={talmas_cfg.lambda_max}  μ={talmas_cfg.mu}  "
               f"timestep_gate={talmas_cfg.use_timestep_gate}  "
@@ -86,10 +97,6 @@ def evaluate(args) -> float:
     # ------------------------------------------------------------------ #
     # Determinism                                                          #
     # ------------------------------------------------------------------ #
-    # Eliminates CUDA non-determinism from parallel reductions in matmul
-    # and softmax.  warn_only=True lets ops without a deterministic CUDA
-    # kernel fall back silently rather than hard-erroring (some LLaDA
-    # gather ops hit this).
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -100,17 +107,10 @@ def evaluate(args) -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Always use eager attention so that:
-    #   1. The block-level TALMAS patch fires (Flash Attention 2 bypasses
-    #      the attention_bias path the hook injects into).
-    #   2. Baseline and TALMAS configs run the same attention kernel,
-    #      removing the implementation switch as a confound.
     tokenizer, model = load_model_and_tokenizer(args.model, eager_attn=True)
 
     print(f"attn_implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
 
-    # Nullify flash_attn_func on every block unconditionally — keeps baseline
-    # and TALMAS on the same code path.
     disabled = 0
     for name, module in model.named_modules():
         if hasattr(module, "flash_attn_func"):
@@ -125,10 +125,12 @@ def evaluate(args) -> float:
     # ------------------------------------------------------------------ #
     # Load dataset                                                         #
     # ------------------------------------------------------------------ #
-    print("Loading GSM8K dataset...")
-    dataset = load_dataset("gsm8k", "main", split=args.split)
-    if args.max_samples:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+    print(f"Loading {dataset_name} dataset...")
+    dataset = adapter.load(
+        split=args.split,
+        max_samples=args.max_samples,
+        indices=indices,
+    )
 
     # ------------------------------------------------------------------ #
     # Resume from checkpoint if present                                    #
@@ -165,12 +167,11 @@ def evaluate(args) -> float:
     # Eval loop                                                            #
     # ------------------------------------------------------------------ #
     try:
-        for example in tqdm(dataset, desc="GSM8K"):
-            question  = example["question"]
-            gold_full = example["answer"]
-            gold_ans  = extract_answer(gold_full)
+        for example in tqdm(dataset, desc=dataset_name.upper()):
+            question = adapter.get_question(example)
+            gold_ans = adapter.extract_gold(example)
 
-            prompt_text = build_prompt(question, is_instruct)
+            prompt_text = adapter.build_prompt(question, is_instruct)
             prompt_ids  = tokenizer(
                 prompt_text,
                 return_tensors="pt",
@@ -189,8 +190,8 @@ def evaluate(args) -> float:
             )
 
             output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-            pred_ans    = extract_answer(output_text)
-            is_correct  = answers_match(pred_ans, gold_ans)
+            pred_ans    = adapter.extract_answer(output_text)
+            is_correct  = adapter.answers_match(pred_ans, gold_ans)
 
             correct += int(is_correct)
             total   += 1
@@ -204,7 +205,6 @@ def evaluate(args) -> float:
             }
             results.append(entry)
 
-            # Append to checkpoint immediately so progress survives preemption
             if args.checkpoint:
                 with open(args.checkpoint, "a") as ckpt_f:
                     ckpt_f.write(json.dumps(entry) + "\n")
@@ -227,9 +227,8 @@ def evaluate(args) -> float:
     # ------------------------------------------------------------------ #
     accuracy = correct / total * 100
     print(f"\n{'='*50}")
-    print(f"GSM8K Accuracy: {correct}/{total} = {accuracy:.1f}%")
+    print(f"{dataset_name.upper()} Accuracy: {correct}/{total} = {accuracy:.1f}%")
     print(f"{'='*50}")
-    print(f"\nPaper reports: 70.3% (Base, 4-shot) / 69.4% (Instruct)")
 
     # ------------------------------------------------------------------ #
     # Save results                                                         #
@@ -238,19 +237,20 @@ def evaluate(args) -> float:
         os.makedirs(args.output_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         tag = "talmas" if args.talmas else "baseline"
-        out_path = os.path.join(args.output_dir, f"gsm8k_{tag}_{ts}.json")
+        out_path = os.path.join(args.output_dir, f"{dataset_name}_{tag}_{ts}.json")
     else:
         out_path = args.output_file
 
     if out_path:
         payload = {
-            "model":       args.model,
-            "accuracy":    accuracy,
-            "correct":     correct,
-            "total":       total,
-            "sampling":    cfg.__dict__,
-            "talmas":      talmas_cfg.__dict__ if talmas_cfg else None,
-            "results":     results,
+            "model":    args.model,
+            "dataset":  dataset_name,
+            "accuracy": accuracy,
+            "correct":  correct,
+            "total":    total,
+            "sampling": cfg.__dict__,
+            "talmas":   talmas_cfg.__dict__ if talmas_cfg else None,
+            "results":  results,
         }
         with open(out_path, "w") as f:
             json.dump(payload, f, indent=2)
@@ -265,18 +265,27 @@ def evaluate(args) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="LLaDA GSM8K evaluation — baseline and TALMAS mode",
+        description="LLaDA evaluation — baseline and TALMAS mode",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # --- Model / dataset ---
     parser.add_argument("--model", type=str, default="GSAI-ML/LLaDA-8B-Base",
                         help="HuggingFace model name or local path")
+    parser.add_argument("--dataset", type=str, default="gsm8k",
+                        choices=list_datasets(),
+                        help="Dataset to evaluate on")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "test"],
-                        help="GSM8K split to evaluate on")
-    parser.add_argument("--max_samples", type=int, default=None,
-                        help="Limit number of examples (None = full 1319-example test set)")
+                        help="Dataset split to evaluate on")
+
+    sample_group = parser.add_mutually_exclusive_group()
+    sample_group.add_argument("--max_samples", type=int, default=None,
+                              help="Evaluate on first N examples")
+    sample_group.add_argument("--indices", type=str, default=None,
+                              help="Comma-separated list of dataset indices to evaluate "
+                                   "(e.g. 0,5,10,15); mutually exclusive with --max_samples")
+
     parser.add_argument("--generation_length", type=int, default=256,
                         help="Number of response tokens to generate")
     parser.add_argument("--steps", type=int, default=256,

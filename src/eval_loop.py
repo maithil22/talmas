@@ -1,5 +1,5 @@
 """
-Shared GSM8K evaluation kernel used by run_sweep.py (and optionally other runners).
+Shared evaluation kernel used by sweep runners and other callers.
 """
 
 import json
@@ -9,12 +9,12 @@ import torch
 from tqdm import tqdm
 
 from src.config import SamplingConfig, TALMASConfig
-from src.utils import build_prompt, extract_answer, answers_match
+from src.datasets import DatasetAdapter
 from src.sampling import low_confidence_remasking_sample
 from src.talmas import TALMASHookManager
 
 
-def eval_gsm8k_config(
+def eval_dataset_config(
     *,
     model,
     tokenizer,
@@ -25,6 +25,7 @@ def eval_gsm8k_config(
     talmas_cfg: TALMASConfig,
     is_instruct: bool,
     dataset,
+    adapter: DatasetAdapter,
     checkpoint_path: Optional[str] = None,
     desc: str = "eval",
 ) -> dict:
@@ -46,10 +47,10 @@ def eval_gsm8k_config(
 
     try:
         for example in tqdm(dataset, desc=desc):
-            question = example["question"]
-            gold_ans = extract_answer(example["answer"])
+            question = adapter.get_question(example)
+            gold_ans = adapter.extract_gold(example)
 
-            prompt_text = build_prompt(question, is_instruct)
+            prompt_text = adapter.build_prompt(question, is_instruct)
             prompt_ids = tokenizer(
                 prompt_text, return_tensors="pt", add_special_tokens=True
             ).input_ids.to(device)
@@ -66,8 +67,8 @@ def eval_gsm8k_config(
             )
 
             output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-            pred_ans = extract_answer(output_text)
-            is_correct = answers_match(pred_ans, gold_ans)
+            pred_ans = adapter.extract_answer(output_text)
+            is_correct = adapter.answers_match(pred_ans, gold_ans)
 
             correct += int(is_correct)
             total += 1
@@ -87,7 +88,7 @@ def eval_gsm8k_config(
 
             status = "✓" if is_correct else "✗"
             tqdm.write(
-                f"[{total:>4}] {status}  gold={gold_ans:<8}  pred={pred_ans:<8}  "
+                f"[{total:>4}] {status}  gold={str(gold_ans):<8}  pred={str(pred_ans):<8}  "
                 f"running acc: {correct}/{total} ({correct / total * 100:.1f}%)"
             )
     finally:
@@ -96,3 +97,7 @@ def eval_gsm8k_config(
 
     accuracy = correct / total if total > 0 else 0.0
     return {"correct": correct, "total": total, "accuracy": accuracy, "results": results}
+
+
+# Backward-compatible alias
+eval_gsm8k_config = eval_dataset_config

@@ -1,7 +1,7 @@
 """
 TALMAS ablation study runner.
 
-Runs all 5 ablation configurations (plus μ sweep for Full TALMAS) on GSM8K,
+Runs all 5 ablation configurations (plus μ sweep for Full TALMAS) on a dataset,
 saves a CSV results table, and produces ablation plots.
 
 Usage:
@@ -9,6 +9,9 @@ Usage:
       --model GSAI-ML/LLaDA-8B-Instruct \\
       --max-samples 100 \\
       --output-dir results
+
+Run on MATH dataset:
+  python scripts/run_ablation.py --dataset math --max-samples 50
 
 For a quick smoke-test (5 samples, 20 steps):
   python scripts/run_ablation.py --max-samples 5 --steps 20
@@ -27,17 +30,14 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from datasets import load_dataset
 from tqdm import tqdm
 
 from src.config import (
     SamplingConfig, TALMASConfig, BASE_CONFIG, INSTRUCT_CONFIG,
     ABLATION_CONFIGS, MU_SWEEP,
 )
-from src.utils import (
-    build_prompt, extract_answer, answers_match,
-    resolve_special_tokens, load_model_and_tokenizer,
-)
+from src.datasets import get_adapter, list_datasets, DatasetAdapter
+from src.utils import resolve_special_tokens, load_model_and_tokenizer
 from src.sampling import low_confidence_remasking_sample
 from src.talmas import TALMASHookManager
 
@@ -57,6 +57,7 @@ def run_one_config(
     talmas_cfg: TALMASConfig,
     is_instruct: bool,
     dataset,
+    adapter: DatasetAdapter,
     config_meta: dict,
 ) -> dict:
     name = config_meta["name"]
@@ -78,9 +79,9 @@ def run_one_config(
 
     try:
         for example in tqdm(dataset, desc=name):
-            question  = example["question"]
-            gold_ans  = extract_answer(example["answer"])
-            prompt_text = build_prompt(question, is_instruct)
+            question  = adapter.get_question(example)
+            gold_ans  = adapter.extract_gold(example)
+            prompt_text = adapter.build_prompt(question, is_instruct)
             prompt_ids  = tokenizer(
                 prompt_text, return_tensors="pt", add_special_tokens=True
             ).input_ids.to(device)
@@ -97,8 +98,8 @@ def run_one_config(
             )
 
             output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-            pred_ans    = extract_answer(output_text)
-            is_correct  = answers_match(pred_ans, gold_ans)
+            pred_ans    = adapter.extract_answer(output_text)
+            is_correct  = adapter.answers_match(pred_ans, gold_ans)
 
             correct += int(is_correct)
             total   += 1
@@ -127,7 +128,8 @@ def run_one_config(
 # Plots
 # ---------------------------------------------------------------------------
 
-def make_plots(df: pd.DataFrame, mu_sweep_values: list, out_path: str) -> None:
+def make_plots(df: pd.DataFrame, mu_sweep_values: list, out_path: str,
+               dataset_name: str = "GSM8K") -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -135,6 +137,7 @@ def make_plots(df: pd.DataFrame, mu_sweep_values: list, out_path: str) -> None:
         return
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    label = dataset_name.upper()
 
     # Plot 1: main ablation bar chart (one bar per config; use μ=0.1 row for config 5)
     main = df[~df["config_name"].str.contains(r"μ=", regex=False)].copy()
@@ -144,8 +147,8 @@ def make_plots(df: pd.DataFrame, mu_sweep_values: list, out_path: str) -> None:
                   color=colors[: len(main)])
     ax.set_xticks(range(len(main)))
     ax.set_xticklabels(main["config_name"], rotation=20, ha="right", fontsize=9)
-    ax.set_ylabel("GSM8K Accuracy")
-    ax.set_title("TALMAS Ablation Study — GSM8K")
+    ax.set_ylabel(f"{label} Accuracy")
+    ax.set_title(f"TALMAS Ablation Study — {label}")
     ax.set_ylim(0, max(main["accuracy"].max() * 1.15, 0.1))
     for bar, val in zip(bars, main["accuracy"]):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
@@ -159,8 +162,8 @@ def make_plots(df: pd.DataFrame, mu_sweep_values: list, out_path: str) -> None:
         acc_vals = mu_rows["accuracy"].tolist()
         ax2.plot(mu_vals, acc_vals, "o-", color="#9B59B6", linewidth=2, markersize=8)
         ax2.set_xlabel("μ (mask→mask suppression scale)")
-        ax2.set_ylabel("GSM8K Accuracy")
-        ax2.set_title("Full TALMAS: μ Sweep")
+        ax2.set_ylabel(f"{label} Accuracy")
+        ax2.set_title(f"Full TALMAS: μ Sweep ({label})")
         ax2.set_xticks(mu_sweep_values)
     else:
         ax2.set_title("μ sweep — no data")
@@ -184,9 +187,15 @@ def main(args):
     if args.generation_length:
         cfg.generation_length = args.generation_length
 
+    dataset_name = args.dataset
+    adapter = get_adapter(dataset_name)
+
+    indices = None
+    if getattr(args, "indices", None):
+        indices = [int(i) for i in args.indices.split(",")]
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Eliminate CUDA non-determinism from parallel reductions.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -194,24 +203,24 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load model once with eager attention (required for TALMAS hook)
     tokenizer, model = load_model_and_tokenizer(args.model, eager_attn=True)
     mask_token_id, eos_token_id = resolve_special_tokens(tokenizer, model)
     print(f"mask_token_id={mask_token_id}, eos_token_id={eos_token_id}")
-    print(f"Steps: {cfg.steps}  GenLen: {cfg.generation_length}  Samples: {args.max_samples}\n")
+    print(f"Steps: {cfg.steps}  GenLen: {cfg.generation_length}  "
+          f"Samples: {indices if indices else args.max_samples}\n")
 
-    # Load dataset once
-    print("Loading GSM8K dataset...")
-    dataset = load_dataset("gsm8k", "main", split=args.split)
-    if args.max_samples:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+    print(f"Loading {dataset_name} dataset...")
+    dataset = adapter.load(
+        split=args.split,
+        max_samples=args.max_samples,
+        indices=indices,
+    )
     print(f"Running ablation on {len(dataset)} examples per config.\n")
 
     all_results = []
 
     for meta in ABLATION_CONFIGS:
         if meta["id"] == 5:
-            # Sweep μ for Full TALMAS
             for mu in MU_SWEEP:
                 swept_meta = dict(meta)
                 swept_meta["name"] = f"Full TALMAS (μ={mu})"
@@ -225,7 +234,7 @@ def main(args):
                     model=model, tokenizer=tokenizer, device=device,
                     mask_token_id=mask_token_id, eos_token_id=eos_token_id,
                     cfg=cfg, talmas_cfg=talmas_cfg, is_instruct=is_instruct,
-                    dataset=dataset, config_meta=swept_meta,
+                    dataset=dataset, adapter=adapter, config_meta=swept_meta,
                 )
                 all_results.append(result)
         else:
@@ -239,21 +248,19 @@ def main(args):
                 model=model, tokenizer=tokenizer, device=device,
                 mask_token_id=mask_token_id, eos_token_id=eos_token_id,
                 cfg=cfg, talmas_cfg=talmas_cfg, is_instruct=is_instruct,
-                dataset=dataset, config_meta=meta,
+                dataset=dataset, adapter=adapter, config_meta=meta,
             )
             all_results.append(result)
 
-    # Save results
     df = pd.DataFrame(all_results)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(args.output_dir, f"talmas_ablation_{ts}.csv")
+    csv_path = os.path.join(args.output_dir, f"ablation_{dataset_name}_{ts}.csv")
     df.to_csv(csv_path, index=False)
     print(f"\nResults saved to {csv_path}")
     print(df[["config_name", "lambda_max", "mu", "n_samples", "accuracy"]].to_string(index=False))
 
-    # Plots
-    plot_path = os.path.join(args.output_dir, f"talmas_ablation_{ts}.png")
-    make_plots(df, MU_SWEEP, plot_path)
+    plot_path = os.path.join(args.output_dir, f"ablation_{dataset_name}_{ts}.png")
+    make_plots(df, MU_SWEEP, plot_path, dataset_name=dataset_name)
 
 
 # ---------------------------------------------------------------------------
@@ -262,16 +269,22 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run TALMAS ablation study on GSM8K",
+        description="Run TALMAS ablation study",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", type=str, default="GSAI-ML/LLaDA-8B-Instruct",
                         help="HuggingFace model name or local path")
+    parser.add_argument("--dataset", type=str, default="gsm8k",
+                        choices=list_datasets(),
+                        help="Dataset to evaluate on")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "test"])
     parser.add_argument("--max-samples", type=int, default=100,
                         dest="max_samples",
                         help="Samples per config (None = full test set)")
+    parser.add_argument("--indices", type=str, default=None,
+                        help="Comma-separated dataset indices (e.g. 0,5,10); "
+                             "overrides --max-samples when provided")
     parser.add_argument("--steps", type=int, default=256,
                         help="Number of diffusion steps")
     parser.add_argument("--generation-length", type=int, default=256,

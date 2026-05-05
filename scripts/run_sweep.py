@@ -30,6 +30,7 @@ import argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.config import SWEEP_CONFIGS, SWEEP_CONFIG_BY_ID
+from src.datasets import list_datasets
 from scripts.gsm8k_eval import evaluate
 
 
@@ -87,8 +88,10 @@ def run(args) -> None:
     # Build the Namespace that gsm8k_eval.evaluate() expects
     eval_args = argparse.Namespace(
         model=args.model,
+        dataset=args.dataset,
         split=args.split,
         max_samples=args.max_samples,
+        indices=args.indices,
         generation_length=args.generation_length,
         steps=args.steps,
         # TALMAS — always enabled for sweep configs
@@ -150,9 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-id", type=int, default=None, dest="config_id",
         help="Sweep config ID to run (see --list-configs)",
     )
-    parser.add_argument("--model",  type=str, default="GSAI-ML/LLaDA-8B-Instruct")
-    parser.add_argument("--split",  type=str, default="test", choices=["train", "test"])
+    parser.add_argument("--model",   type=str, default="GSAI-ML/LLaDA-8B-Instruct")
+    parser.add_argument("--dataset", type=str, default="gsm8k",
+                        choices=list_datasets(),
+                        help="Dataset to evaluate on")
+    parser.add_argument("--split",   type=str, default="test", choices=["train", "test"])
     parser.add_argument("--max-samples",       type=int,   default=100,  dest="max_samples")
+    parser.add_argument("--indices",           type=str,   default=None,
+                        help="Comma-separated dataset indices (e.g. 0,5,10); "
+                             "overrides --max-samples when provided")
     parser.add_argument("--steps",             type=int,   default=256)
     parser.add_argument("--generation-length", type=int,   default=256, dest="generation_length")
     parser.add_argument("--output-dir",        type=str,   default="results/sweep", dest="output_dir")
