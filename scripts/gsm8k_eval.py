@@ -73,7 +73,10 @@ def evaluate(args) -> float:
     adapter = get_adapter(dataset_name)
 
     indices = None
-    if getattr(args, "indices", None):
+    if getattr(args, "indices_file", None):
+        with open(args.indices_file) as f:
+            indices = json.load(f)["all_indices"]
+    elif getattr(args, "indices", None):
         indices = [int(i) for i in args.indices.split(",")]
 
     print(f"Model:             {args.model}")
@@ -285,6 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
     sample_group.add_argument("--indices", type=str, default=None,
                               help="Comma-separated list of dataset indices to evaluate "
                                    "(e.g. 0,5,10,15); mutually exclusive with --max_samples")
+    sample_group.add_argument("--indices-file", type=str, default=None,
+                              help="JSON file with an 'all_indices' key (output of "
+                                   "scripts/sample_math_levels.py)")
 
     parser.add_argument("--generation_length", type=int, default=256,
                         help="Number of response tokens to generate")
